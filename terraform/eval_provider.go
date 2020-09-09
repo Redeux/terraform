@@ -46,12 +46,29 @@ func buildProviderConfig(ctx EvalContext, addr addrs.AbsProviderConfig, config *
 	}
 }
 
+// GetProvider returns the providers interface and schema for a given provider.
+func GetProvider(ctx EvalContext, addr addrs.AbsProviderConfig) (providers.Interface, *ProviderSchema, error) {
+	if addr.Provider.Type == "" {
+		// Should never happen
+		panic("EvalGetProvider used with uninitialized provider configuration address")
+	}
+	provider := ctx.Provider(addr)
+	if provider == nil {
+		return nil, &ProviderSchema{}, fmt.Errorf("provider %s not initialized", addr)
+	}
+	// Not all callers require a schema, so we will leave checking for a nil
+	// schema to the callers.
+	schema := ctx.ProviderSchema(addr)
+	return provider, schema, nil
+}
+
 // EvalConfigProvider is an EvalNode implementation that configures
 // a provider that is already initialized and retrieved.
 type EvalConfigProvider struct {
-	Addr     addrs.AbsProviderConfig
-	Provider *providers.Interface
-	Config   *configs.Provider
+	Addr                addrs.AbsProviderConfig
+	Provider            *providers.Interface
+	Config              *configs.Provider
+	VerifyConfigIsKnown bool
 }
 
 func (n *EvalConfigProvider) Eval(ctx EvalContext) (interface{}, error) {
@@ -75,6 +92,16 @@ func (n *EvalConfigProvider) Eval(ctx EvalContext) (interface{}, error) {
 	configVal, configBody, evalDiags := ctx.EvaluateBlock(configBody, configSchema, nil, EvalDataForNoInstanceKey)
 	diags = diags.Append(evalDiags)
 	if evalDiags.HasErrors() {
+		return nil, diags.NonFatalErr()
+	}
+
+	if n.VerifyConfigIsKnown && !configVal.IsWhollyKnown() {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid provider configuration",
+			Detail:   fmt.Sprintf("The configuration for %s depends on values that cannot be determined until apply.", n.Addr),
+			Subject:  &config.DeclRange,
+		})
 		return nil, diags.NonFatalErr()
 	}
 

@@ -199,7 +199,7 @@ var (
 	_ GraphNodeResourceInstance     = (*NodeRefreshableManagedResourceInstance)(nil)
 	_ GraphNodeAttachResourceConfig = (*NodeRefreshableManagedResourceInstance)(nil)
 	_ GraphNodeAttachResourceState  = (*NodeRefreshableManagedResourceInstance)(nil)
-	_ GraphNodeEvalable             = (*NodeRefreshableManagedResourceInstance)(nil)
+	_ GraphNodeExecutable           = (*NodeRefreshableManagedResourceInstance)(nil)
 )
 
 // GraphNodeDestroyer
@@ -209,23 +209,25 @@ func (n *NodeRefreshableManagedResourceInstance) DestroyAddr() *addrs.AbsResourc
 }
 
 // GraphNodeEvalable
-func (n *NodeRefreshableManagedResourceInstance) EvalTree() EvalNode {
+func (n *NodeRefreshableManagedResourceInstance) Execute(ctx EvalContext, op walkOperation) error {
 	addr := n.ResourceInstanceAddr()
 
 	// Eval info is different depending on what kind of resource this is
 	switch addr.Resource.Resource.Mode {
 	case addrs.ManagedResourceMode:
-		if n.ResourceState == nil {
+		if n.instanceState == nil {
 			log.Printf("[TRACE] NodeRefreshableManagedResourceInstance: %s has no existing state to refresh", addr)
-			return n.evalTreeManagedResourceNoState()
+			_, err := n.evalTreeManagedResourceNoState().Eval(ctx)
+			return err
 		}
 		log.Printf("[TRACE] NodeRefreshableManagedResourceInstance: %s will be refreshed", addr)
-		return n.evalTreeManagedResource()
+		_, err := n.evalTreeManagedResource().Eval(ctx)
+		return err
 
 	case addrs.DataResourceMode:
 		// Get the data source node. If we don't have a configuration
 		// then it is an orphan so we destroy it (remove it from the state).
-		var dn GraphNodeEvalable
+		var dn GraphNodeExecutable
 		if n.Config != nil {
 			dn = &NodeRefreshableDataResourceInstance{
 				NodeAbstractResourceInstance: n.NodeAbstractResourceInstance,
@@ -236,7 +238,7 @@ func (n *NodeRefreshableManagedResourceInstance) EvalTree() EvalNode {
 			}
 		}
 
-		return dn.EvalTree()
+		return dn.Execute(ctx, op)
 	default:
 		panic(fmt.Errorf("unsupported resource mode %s", addr.Resource.Resource.Mode))
 	}
@@ -253,7 +255,7 @@ func (n *NodeRefreshableManagedResourceInstance) evalTreeManagedResource() EvalN
 
 	// This happened during initial development. All known cases were
 	// fixed and tested but as a sanity check let's assert here.
-	if n.ResourceState == nil {
+	if n.instanceState == nil {
 		err := fmt.Errorf(
 			"No resource state attached for addr: %s\n\n"+
 				"This is a bug. Please report this to Terraform with your configuration\n"+

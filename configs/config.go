@@ -81,7 +81,9 @@ type Config struct {
 // module, along with references to any child modules. This is used to
 // determine which modules require which providers.
 type ModuleRequirements struct {
-	Module       *Module
+	Name         string
+	SourceAddr   string
+	SourceDir    string
 	Requirements getproviders.Requirements
 	Children     map[string]*ModuleRequirements
 }
@@ -183,12 +185,7 @@ func (c *Config) DescendentForInstance(path addrs.ModuleInstance) *Config {
 // may be incomplete.
 func (c *Config) ProviderRequirements() (getproviders.Requirements, hcl.Diagnostics) {
 	reqs := make(getproviders.Requirements)
-	diags := c.addProviderRequirements(reqs)
-
-	for _, childConfig := range c.Children {
-		moreDiags := childConfig.addProviderRequirements(reqs)
-		diags = append(diags, moreDiags...)
-	}
+	diags := c.addProviderRequirements(reqs, true)
 
 	return reqs, diags
 }
@@ -201,17 +198,19 @@ func (c *Config) ProviderRequirements() (getproviders.Requirements, hcl.Diagnost
 // may be incomplete.
 func (c *Config) ProviderRequirementsByModule() (*ModuleRequirements, hcl.Diagnostics) {
 	reqs := make(getproviders.Requirements)
-	diags := c.addProviderRequirements(reqs)
+	diags := c.addProviderRequirements(reqs, false)
 
 	children := make(map[string]*ModuleRequirements)
 	for name, child := range c.Children {
 		childReqs, childDiags := child.ProviderRequirementsByModule()
+		childReqs.Name = name
 		children[name] = childReqs
 		diags = append(diags, childDiags...)
 	}
 
 	ret := &ModuleRequirements{
-		Module:       c.Module,
+		SourceAddr:   c.SourceAddr,
+		SourceDir:    c.Module.SourceDir,
 		Requirements: reqs,
 		Children:     children,
 	}
@@ -221,9 +220,9 @@ func (c *Config) ProviderRequirementsByModule() (*ModuleRequirements, hcl.Diagno
 
 // addProviderRequirements is the main part of the ProviderRequirements
 // implementation, gradually mutating a shared requirements object to
-// eventually return. This function only adds requirements for the top-level
-// module.
-func (c *Config) addProviderRequirements(reqs getproviders.Requirements) hcl.Diagnostics {
+// eventually return. If the recurse argument is true, the requirements will
+// include all descendant modules; otherwise, only the specified module.
+func (c *Config) addProviderRequirements(reqs getproviders.Requirements, recurse bool) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 
 	// First we'll deal with the requirements directly in _our_ module...
@@ -236,11 +235,22 @@ func (c *Config) addProviderRequirements(reqs getproviders.Requirements) hcl.Dia
 		}
 		// The model of version constraints in this package is still the
 		// old one using a different upstream module to represent versions,
-		// so we'll need to shim that out here for now. We assume this
-		// will always succeed because these constraints already succeeded
-		// parsing with the other constraint parser, which uses the same
-		// syntax.
-		constraints := getproviders.MustParseVersionConstraints(providerReqs.Requirement.Required.String())
+		// so we'll need to shim that out here for now. The two parsers
+		// don't exactly agree in practice 🙄 so this might produce new errors.
+		// TODO: Use the new parser throughout this package so we can get the
+		// better error messages it produces in more situations.
+		constraints, err := getproviders.ParseVersionConstraints(providerReqs.Requirement.Required.String())
+		if err != nil {
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid version constraint",
+				// The errors returned by ParseVersionConstraint already include
+				// the section of input that was incorrect, so we don't need to
+				// include that here.
+				Detail:  fmt.Sprintf("Incorrect version constraint syntax: %s.", err.Error()),
+				Subject: providerReqs.Requirement.DeclRange.Ptr(),
+			})
+		}
 		reqs[fqn] = append(reqs[fqn], constraints...)
 	}
 	// Each resource in the configuration creates an *implicit* provider
@@ -272,8 +282,32 @@ func (c *Config) addProviderRequirements(reqs getproviders.Requirements) hcl.Dia
 			reqs[fqn] = nil
 		}
 		if provider.Version.Required != nil {
-			constraints := getproviders.MustParseVersionConstraints(provider.Version.Required.String())
+			// The model of version constraints in this package is still the
+			// old one using a different upstream module to represent versions,
+			// so we'll need to shim that out here for now. The two parsers
+			// don't exactly agree in practice 🙄 so this might produce new errors.
+			// TODO: Use the new parser throughout this package so we can get the
+			// better error messages it produces in more situations.
+			constraints, err := getproviders.ParseVersionConstraints(provider.Version.Required.String())
+			if err != nil {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid version constraint",
+					// The errors returned by ParseVersionConstraint already include
+					// the section of input that was incorrect, so we don't need to
+					// include that here.
+					Detail:  fmt.Sprintf("Incorrect version constraint syntax: %s.", err.Error()),
+					Subject: provider.Version.DeclRange.Ptr(),
+				})
+			}
 			reqs[fqn] = append(reqs[fqn], constraints...)
+		}
+	}
+
+	if recurse {
+		for _, childConfig := range c.Children {
+			moreDiags := childConfig.addProviderRequirements(reqs, true)
+			diags = append(diags, moreDiags...)
 		}
 	}
 
